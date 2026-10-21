@@ -1,0 +1,12 @@
+.env*
+.env.local
+.env.*.local
+!.env.example
+.git/config
+tmp/cache
+bearly-secure.log
+.env
+data/bearly-secure.sqlite
+data/bearly-secure.sqlite-wal
+data/bulk-tax-documents/import.zip
+data/uploads/untrusted.pdf

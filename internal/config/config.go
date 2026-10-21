@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -36,6 +38,8 @@ type Config struct {
 	MaxPublicProductResults    int
 	ActiveEncryptionKeyVersion string
 	EncryptionKeys             map[string][32]byte
+	DownloadSigningKey         [32]byte
+	TrustedProxyHops           int
 }
 
 type AttackerLabConfig struct {
@@ -43,14 +47,26 @@ type AttackerLabConfig struct {
 }
 
 func Load(workingDirectory string) (Config, error) {
-	return Parse(processEnvironment(), workingDirectory)
+	values, err := loadEnvValues(filepath.Join(workingDirectory, ".env"))
+	if err != nil {
+		return Config{}, err
+	}
+	return Parse(values, workingDirectory)
 }
 
 func LoadAttackerLab(workingDirectory string) (AttackerLabConfig, error) {
-	return ParseAttackerLab(processEnvironment())
+	values, err := loadEnvValues(filepath.Join(workingDirectory, ".env"))
+	if err != nil {
+		return AttackerLabConfig{}, err
+	}
+	return ParseAttackerLab(values)
 }
 
 func Parse(environment map[string]string, workingDirectory string) (Config, error) {
+	proxyHops, err := parseNonNegativeInteger(valueOrDefault(environment, "TRUST_PROXY_HOPS", "0"), "TRUST_PROXY_HOPS")
+	if err != nil {
+		return Config{}, err
+	}
 	port, err := parseNonNegativeInteger(valueOrDefault(environment, "PORT", strconv.Itoa(defaultPort)), "PORT")
 	if err != nil {
 		return Config{}, err
@@ -68,7 +84,7 @@ func Parse(environment map[string]string, workingDirectory string) (Config, erro
 		return Config{}, err
 	}
 
-	activeEncryptionKeyVersion, encryptionKeys, err := parseOptionalEncryptionKeys(environment)
+	activeEncryptionKeyVersion, encryptionKeys, err := parseEncryptionKeys(environment)
 	if err != nil {
 		return Config{}, err
 	}
@@ -77,9 +93,22 @@ func Parse(environment map[string]string, workingDirectory string) (Config, erro
 	if databasePath == "" {
 		databasePath = filepath.Join(workingDirectory, "data", defaultDatabaseFilename)
 	}
+	pawPalAPIKey, err := requireEnvironmentalVariable(environment, "PAWPAL_API_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+
+	downloadSigningRawKey, err := requireEnvironmentalVariable(environment, "DOWNLOAD_SIGNING_KEY")
+	if err != nil {
+		return Config{}, err
+	}
+	downloadSigningKey, err := parseEncryptionKey(downloadSigningRawKey, "DOWNLOAD_SIGNING_KEY")
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
-		PawPalAPIKey:               "bs_test_pawpal_starter_key",
+		PawPalAPIKey:               pawPalAPIKey,
 		AppOrigin:                  appOrigin,
 		Port:                       port,
 		DatabasePath:               databasePath,
@@ -89,6 +118,8 @@ func Parse(environment map[string]string, workingDirectory string) (Config, erro
 		MaxPublicProductResults:    MaxPublicProductResults,
 		ActiveEncryptionKeyVersion: activeEncryptionKeyVersion,
 		EncryptionKeys:             encryptionKeys,
+		DownloadSigningKey:         downloadSigningKey,
+		TrustedProxyHops:           proxyHops,
 	}, nil
 }
 
@@ -101,17 +132,6 @@ func ParseAttackerLab(environment map[string]string) (AttackerLabConfig, error) 
 		return AttackerLabConfig{}, errors.New("ATTACKER_LAB_PORT must be no greater than 65535")
 	}
 	return AttackerLabConfig{Port: port}, nil
-}
-
-func processEnvironment() map[string]string {
-	environment := make(map[string]string)
-	for _, entry := range os.Environ() {
-		name, value, found := strings.Cut(entry, "=")
-		if found {
-			environment[name] = value
-		}
-	}
-	return environment
 }
 
 func valueOrDefault(environment map[string]string, name, fallback string) string {
@@ -219,4 +239,31 @@ func normalizeEncryptionVersion(version string) (string, error) {
 		}
 	}
 	return normalized, nil
+}
+
+func requireEnvironmentalVariable(environment map[string]string, name string) (string, error) {
+	value := environment[name]
+	if value == "" {
+		return "", fmt.Errorf("missing required environment variable: %s", name)
+	}
+	return value, nil
+}
+
+func loadEnvValues(workingDirectory string) (map[string]string, error) {
+	envValues, err := godotenv.Read(workingDirectory)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return map[string]string{}, fmt.Errorf("can't read .env file %s", err)
+	} else if err != nil {
+		envValues = make(map[string]string)
+	}
+	localValues := os.Environ()
+	localValuesParsed := make(map[string]string)
+	for _, value := range localValues {
+		splitValue := strings.SplitN(value, "=", 2)
+		localValuesParsed[splitValue[0]] = splitValue[1]
+	}
+	for key, value := range localValuesParsed {
+		envValues[key] = value
+	}
+	return envValues, nil
 }

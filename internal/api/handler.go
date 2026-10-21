@@ -34,6 +34,21 @@ type Handler struct {
 	maxProductResults int64
 }
 
+type productResponse struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	ImagePath   string `json:"image_path"`
+	PriceCents  int64  `json:"price_cents"`
+}
+
+type orderResponse struct {
+	ID         int64  `json:"id"`
+	Status     string `json:"status"`
+	TotalCents int64  `json:"total_cents"`
+	CreatedAt  string `json:"created_at"`
+}
+
 func NewHandler(accountStore *accounts.Store, orderStore *orders.Store, productStore *storefront.Store, apiStore *Store, logger *logging.Logger, maxProductResults int) *Handler {
 	return &Handler{
 		accountStore: accountStore, orderStore: orderStore, productStore: productStore, apiStore: apiStore,
@@ -51,11 +66,18 @@ func (handler *Handler) AccountOrders(responseWriter http.ResponseWriter, reques
 		handler.internalError(responseWriter, request, err)
 		return
 	}
-	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"orders": orders})
+	mappedOrders := make([]orderResponse, len(orders))
+	for i, order := range orders {
+		mappedOrders[i].ID = order.ID
+		mappedOrders[i].Status = order.Status
+		mappedOrders[i].TotalCents = order.TotalCents
+		mappedOrders[i].CreatedAt = order.CreatedAt
+	}
+	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"orders": mappedOrders})
 }
 
 func (handler *Handler) Order(responseWriter http.ResponseWriter, request *http.Request) {
-	_, ok := handler.requireAuthentication(responseWriter, request)
+	current, ok := handler.requireAuthentication(responseWriter, request)
 	if !ok {
 		return
 	}
@@ -69,7 +91,8 @@ func (handler *Handler) Order(responseWriter http.ResponseWriter, request *http.
 		handler.internalError(responseWriter, request, err)
 		return
 	}
-	if !found {
+	mappedOrder := orderResponse{ID: order.ID, Status: order.Status, TotalCents: order.TotalCents, CreatedAt: order.CreatedAt}
+	if !found || order.UserID != current.User.ID {
 		httpx.RespondWithJSON(responseWriter, http.StatusNotFound, map[string]string{"error": "Order not found"})
 		return
 	}
@@ -82,19 +105,62 @@ func (handler *Handler) Order(responseWriter http.ResponseWriter, request *http.
 	for _, item := range items {
 		itemResponses = append(itemResponses, orderItemResponse{ProductID: item.ProductID, ProductName: item.ProductName, Quantity: item.Quantity, PriceCents: item.PriceCents})
 	}
-	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"order": order, "items": itemResponses})
+	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"order": mappedOrder, "items": itemResponses})
 }
 
 func (handler *Handler) Products(responseWriter http.ResponseWriter, request *http.Request) {
-	products, err := handler.productStore.ListAllProducts(request.Context())
+	products, err := handler.productStore.ListProducts(request.Context(), handler.maxProductResults)
 	if err != nil {
 		handler.internalError(responseWriter, request, err)
 		return
 	}
-	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"products": products})
+	responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+	mappedProducts := make([]productResponse, len(products))
+	for i, product := range products {
+		mappedProducts[i].ID = product.ID
+		mappedProducts[i].Name = product.Name
+		mappedProducts[i].Description = product.Description
+		mappedProducts[i].ImagePath = product.ImagePath
+		mappedProducts[i].PriceCents = product.PriceCents
+	}
+	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{"products": mappedProducts})
+}
+
+func (handler *Handler) OptionsProducts(responseWriter http.ResponseWriter, request *http.Request) {
+	responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+	if request.Method == http.MethodOptions {
+		responseWriter.Header().Set("Access-Control-Allow-Methods", "GET")
+		responseWriter.WriteHeader(http.StatusNoContent)
+		return
+	}
 }
 
 func (handler *Handler) WarehouseOrders(responseWriter http.ResponseWriter, request *http.Request) {
+	apiKey := request.Header.Get("X-API-Key")
+	key, found, err := handler.apiStore.FindKey(request.Context(), apiKey)
+	if err != nil {
+		handler.internalError(responseWriter, request, err)
+		return
+	}
+	if !found {
+		httpx.RespondWithJSON(responseWriter, http.StatusUnauthorized, map[string]string{"error": "Key is missing or invalid"})
+		return
+	}
+	if key.Scope != "orders:read" {
+		httpx.RespondWithJSON(responseWriter, http.StatusForbidden, map[string]string{"error": "Unathorized"})
+		return
+	}
+	quota, err := handler.apiStore.ConsumeQuota(request.Context(), key.ID)
+	if err != nil {
+		handler.internalError(responseWriter, request, err)
+		return
+	}
+	SetQuotaHeaders(responseWriter, quota)
+	if !quota.Allowed {
+		RespondWithQuotaExhausted(responseWriter, quota)
+		return
+	}
+	quotaResponse := ToQuotaResponse(quota)
 	orders, err := handler.orderStore.ListAll(request.Context())
 	if err != nil {
 		handler.internalError(responseWriter, request, err)
@@ -109,6 +175,7 @@ func (handler *Handler) WarehouseOrders(responseWriter http.ResponseWriter, requ
 	httpx.RespondWithJSON(responseWriter, http.StatusOK, map[string]any{
 		"integration": "Warehouse Fulfillment Integration",
 		"orders":      responses,
+		"quota":       quotaResponse,
 	})
 }
 

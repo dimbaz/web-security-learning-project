@@ -112,6 +112,7 @@ func (handler *authHandler) TOTPLogin(responseWriter http.ResponseWriter, reques
 			handler.internalError(responseWriter, request, err)
 			return
 		}
+
 		clearTOTPLoginChallengeCookie(responseWriter)
 		http.Redirect(responseWriter, request, verificationRestartLoginPath(challenge.ReturnTo), http.StatusFound)
 		return
@@ -139,6 +140,10 @@ func (handler *authHandler) TOTPLogin(responseWriter http.ResponseWriter, reques
 			"failureReason": "totp code mismatch",
 			"returnTo":      challenge.ReturnTo,
 		})
+		requestID, _ := httpx.RequestIdFromContext(request.Context())
+		sourceIP := clientIPKeyWithTrustedProxies(handler.trustedProxyHops)(request)
+		userID := nullableUserID(user, userFound)
+		handler.authAlertFailedLogins.Record(requestID.String(), sourceIP, userID)
 		if exhausted {
 			clearTOTPLoginChallengeCookie(responseWriter)
 			http.Redirect(responseWriter, request, verificationRestartLoginPath(challenge.ReturnTo), http.StatusFound)
@@ -189,6 +194,7 @@ func (handler *authHandler) MFARecoveryPage(responseWriter http.ResponseWriter, 
 func (handler *authHandler) RecoverMFA(responseWriter http.ResponseWriter, request *http.Request) {
 	email, emailErr := httpx.FormValue(request, "email")
 	password, passwordErr := httpx.FormValue(request, "password")
+
 	backupCode, backupCodeErr := httpx.FormValue(request, "backupCode")
 	if emailErr != nil || passwordErr != nil || backupCodeErr != nil {
 		handler.invalidForm(responseWriter)
@@ -225,6 +231,18 @@ func (handler *authHandler) RecoverMFA(responseWriter http.ResponseWriter, reque
 		}
 		return
 	}
+	if passwords.NeedsRehash(user.PasswordHash) {
+		passwordHash, err := passwords.Hash(password)
+		if err != nil {
+			handler.internalError(responseWriter, request, err)
+			return
+		}
+		err = handler.accounts.UpdatePasswordHash(request.Context(), user.ID, passwordHash)
+		if err != nil {
+			handler.internalError(responseWriter, request, err)
+			return
+		}
+	}
 	consumed, err := handler.mfa.ConsumeBackupCode(request.Context(), user.ID, backupCode)
 	if err != nil {
 		handler.internalError(responseWriter, request, err)
@@ -259,11 +277,13 @@ func (handler *authHandler) RecoverMFA(responseWriter http.ResponseWriter, reque
 		handler.internalError(responseWriter, request, err)
 		return
 	}
-	handler.logMFARecovery(user.Email, user.ID, true, "")
+
 	sessions.SetCookie(responseWriter, session)
 	if challengeToken != "" {
 		clearTOTPLoginChallengeCookie(responseWriter)
 	}
+	handler.logMFARecovery(user.Email, user.ID, true, "")
+
 	http.Redirect(responseWriter, request, "/account/totp", http.StatusFound)
 }
 
@@ -291,7 +311,11 @@ func (handler *authHandler) RequestPasswordReset(responseWriter http.ResponseWri
 			"success":       false,
 			"failureReason": "email not found",
 		})
-		if err := handler.renderPasswordResetRequest(responseWriter, http.StatusNotFound, false, "No account exists for that email.", ""); err != nil {
+		requestID, _ := httpx.RequestIdFromContext(request.Context())
+		sourceIP := clientIPKeyWithTrustedProxies(handler.trustedProxyHops)(request)
+		userID := nullableUserID(user, found)
+		handler.authAlertPasswordReset.Record(requestID.String(), sourceIP, userID)
+		if err := handler.renderPasswordResetRequest(responseWriter, http.StatusOK, true, "", ""); err != nil {
 			handler.internalError(responseWriter, request, err)
 		}
 		return
@@ -313,7 +337,11 @@ func (handler *authHandler) RequestPasswordReset(responseWriter http.ResponseWri
 		"resetToken": resetToken.Value,
 		"resetLink":  resetLink,
 	})
-	if err := handler.renderPasswordResetRequest(responseWriter, http.StatusOK, true, "", "/password-reset/"+resetToken.Value); err != nil {
+	requestID, _ := httpx.RequestIdFromContext(request.Context())
+	sourceIP := clientIPKeyWithTrustedProxies(handler.trustedProxyHops)(request)
+	userID := nullableUserID(user, found)
+	handler.authAlertPasswordReset.Record(requestID.String(), sourceIP, userID)
+	if err := handler.renderPasswordResetRequest(responseWriter, http.StatusOK, true, "", ""); err != nil {
 		handler.internalError(responseWriter, request, err)
 	}
 }

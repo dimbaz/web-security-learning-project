@@ -9,11 +9,13 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/bootdotdev/learn-web-security/internal/httpx"
 	"github.com/bootdotdev/learn-web-security/internal/logging"
@@ -29,19 +31,28 @@ func applyMiddleware(handler http.Handler, middlewareChain ...middleware) http.H
 	return handler
 }
 
-func permissiveCORS(next http.Handler) http.Handler {
+func corpHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
-		if origin := request.Header.Get("Origin"); origin != "" {
-			responseWriter.Header().Set("Access-Control-Allow-Origin", origin)
-			responseWriter.Header().Set("Access-Control-Allow-Credentials", "true")
-			responseWriter.Header().Set("Vary", "Origin")
-		}
-		if request.Method == http.MethodOptions {
-			responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			responseWriter.Header().Set("Access-Control-Allow-Headers", request.Header.Get("Access-Control-Request-Headers"))
-			responseWriter.WriteHeader(http.StatusNoContent)
-			return
-		}
+		responseWriter.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+		next.ServeHTTP(responseWriter, request)
+	})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		nonce := httpx.CSPNonce(request.Context())
+		cspValue := fmt.Sprintf("default-src 'self'; script-src 'self' 'nonce-%s'; style-src 'self'; img-src 'self' data:; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'", nonce)
+		responseWriter.Header().Set("Content-Security-Policy", cspValue)
+		responseWriter.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		responseWriter.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		responseWriter.Header().Set("Origin-Agent-Cluster", "?1")
+		responseWriter.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		responseWriter.Header().Set("X-Content-Type-Options", "nosniff")
+		responseWriter.Header().Set("X-DNS-Prefetch-Control", "off")
+		responseWriter.Header().Set("X-Download-Options", "noopen")
+		responseWriter.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		responseWriter.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
+		responseWriter.Header().Set("X-XSS-Protection", "0")
 		next.ServeHTTP(responseWriter, request)
 	})
 }
@@ -79,16 +90,42 @@ func recoverPanics(logger *logging.Logger, renderer *templates.Renderer) middlew
 	}
 }
 
-func LoadShedder(_ int, _ int) func(http.Handler) http.Handler {
+func LoadShedder(capacity int, retryAfter int) func(http.Handler) http.Handler {
+	if capacity <= 0 {
+		panic("capacity must be positive")
+	}
+	if retryAfter <= 0 {
+		panic("retry after limit must be positive")
+	}
+	ch := make(chan struct{}, capacity)
+
 	return func(next http.Handler) http.Handler {
-		return next
+		return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+			responseWriter.Header().Set("X-In-Flight-Limit", strconv.Itoa(capacity))
+			select {
+			case ch <- struct{}{}:
+				defer func() { <-ch }()
+				next.ServeHTTP(responseWriter, request)
+			default:
+				responseWriter.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				httpx.RespondWithError(responseWriter, http.StatusServiceUnavailable, "Service is at capacity")
+			}
+		})
 	}
 }
 
-func SearchThrottle(_ *templates.Renderer) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return next
-	}
+func SearchThrottle(renderer *templates.Renderer) func(http.Handler) http.Handler {
+	return fixedWindowRateLimiter(rateLimitOptions{
+		window:  time.Second,
+		maximum: 5,
+		key: func(*http.Request) string {
+			return "constant-key"
+		},
+		onLimit: func(w http.ResponseWriter, r *http.Request, rls rateLimitState) {
+			httpx.RespondWithErrorPage(w, renderer, http.StatusTooManyRequests, "Search Is Busy", "Try again shortly.")
+		},
+		now: time.Now,
+	})
 }
 
 type rateLimitCounter struct {
@@ -198,8 +235,17 @@ func (limiter *fixedWindowLimiter) reject(responseWriter http.ResponseWriter, re
 
 func fixedWindowRateLimiter(options rateLimitOptions) middleware {
 	validateRateLimitOptions(options)
+	limiter := newFixedWindowLimiter(options)
 	return func(next http.Handler) http.Handler {
-		return next
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rateLimitState, limited := limiter.consume(r)
+			if limited {
+				limiter.reject(w, r, rateLimitState)
+				return
+			}
+			setRateLimitHeaders(w, rateLimitState)
+			next.ServeHTTP(w, r)
+		})
 	}
 }
 
@@ -240,4 +286,48 @@ func boolToInt64(value bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+func originMiddleware(origin string, renderer *templates.Renderer) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+			if request.URL.Path == "/integrations/pawpal/webhook" {
+				next.ServeHTTP(responseWriter, request)
+				return
+			}
+			if request.Method != "POST" {
+				next.ServeHTTP(responseWriter, request)
+				return
+			}
+
+			originHeader := request.Header.Get("Origin")
+			claimedOrigin := ""
+			refererHeader := request.Header.Get("Referer")
+			if originHeader != "" {
+				claimedOrigin = originHeader
+			} else if refererHeader != "" {
+				parsedReferer, err := url.Parse(refererHeader)
+				if err == nil {
+					claimedOrigin = parsedReferer.Scheme + "://" + parsedReferer.Host
+				}
+			}
+			if claimedOrigin != origin {
+				if err := httpx.RespondWithErrorPage(responseWriter, renderer, http.StatusForbidden, "Forbidden", ""); err != nil {
+					http.Error(responseWriter, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				}
+				return
+			}
+			next.ServeHTTP(responseWriter, request)
+		})
+	}
+}
+
+func uuidMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := uuid.NewV4()
+		ctx := httpx.WithRequestID(r.Context(), requestID)
+		r = r.WithContext(ctx)
+		w.Header().Set("X-Request-ID", requestID.String())
+		next.ServeHTTP(w, r)
+	})
 }

@@ -3,6 +3,7 @@ package pawpal
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -23,6 +24,8 @@ func NewHandler(orderStore *orders.Store, logger *logging.Logger, apiKey string)
 }
 
 func (handler *Handler) Webhook(responseWriter http.ResponseWriter, request *http.Request) {
+	fmt.Println("DEBUG: received key =", request.Header.Get("X-PawPal-Key"))
+	fmt.Println("DEBUG: expected key =", handler.apiKey)
 	request.Body = http.MaxBytesReader(responseWriter, request.Body, maxWebhookBodyBytes)
 	decoder := json.NewDecoder(request.Body)
 	var payload any
@@ -35,7 +38,7 @@ func (handler *Handler) Webhook(responseWriter http.ResponseWriter, request *htt
 		return
 	}
 
-	verification := VerifyWebhook(payload)
+	verification := VerifyWebhook([]byte(request.Header.Get("X-PawPal-Key")), []byte(handler.apiKey), payload)
 	switch verification.Outcome {
 	case WebhookUnauthorized:
 		http.Error(responseWriter, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)

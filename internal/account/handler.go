@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootdotdev/learn-web-security/internal/accounts"
 	"github.com/bootdotdev/learn-web-security/internal/auth/mfa"
+	"github.com/bootdotdev/learn-web-security/internal/auth/passwords"
 	"github.com/bootdotdev/learn-web-security/internal/auth/sessions"
 	"github.com/bootdotdev/learn-web-security/internal/httpx"
 	"github.com/bootdotdev/learn-web-security/internal/logging"
@@ -58,6 +59,7 @@ type totpBackupCodesView struct {
 
 func (handler *Handler) Page(responseWriter http.ResponseWriter, request *http.Request) {
 	current, ok := handler.requireAuth(responseWriter, request)
+	handler.logger.Event("account_accessed", map[string]any{"userId": current.User.ID, "email": current.User.Email, "expiresAt": formatTimestamp(current.Session.ExpiresAt)})
 	if !ok {
 		return
 	}
@@ -71,9 +73,18 @@ func (handler *Handler) UpdateEmail(responseWriter http.ResponseWriter, request 
 	if !ok || !handler.verifyCSRF(responseWriter, request, current.Session.CSRFToken) {
 		return
 	}
+	currPass, err := httpx.FormValue(request, "currentPassword")
+	if err != nil {
+		handler.errorPage(responseWriter, http.StatusBadRequest, "Invalid Request", "The submitted form is invalid.")
+		return
+	}
+	if currPass == "" || !passwords.Verify(currPass, current.User.PasswordHash) {
+		handler.renderPage(responseWriter, http.StatusForbidden, current, "Your password is missing or incorrect")
+		return
+	}
 	email, emailErr := httpx.FormValue(request, "email")
 	if emailErr != nil {
-		handler.errorPage(responseWriter, http.StatusBadRequest, "Invalid Request", "The submitted form is invalid.")
+		handler.renderPage(responseWriter, http.StatusBadRequest, current, "The submitted form is invalid.")
 		return
 	}
 	email = accounts.NormalizeEmail(email)
